@@ -24,20 +24,23 @@
   SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 */
 
-import GObject from 'gi://GObject';
-import * as FileModule from './helpers/file.js';
-import { gettext as _ } from 'resource:///org/gnome/shell/extensions/extension.js';
-import NM from 'gi://NM';
+const GObject = imports.gi.GObject;
+const Me = imports.misc.extensionUtils.getCurrentExtension();
+const FileModule = Me.imports.helpers.file;
+const SubProcessModule = Me.imports.helpers.subprocess;
+const Gettext = imports.gettext.domain(Me.metadata['gettext-domain']);
+const _ = Gettext.gettext;
+const NM = imports.gi.NM;
 
 let GTop, hasGTop = true;
 try {
-    ({default: GTop} = await import('gi://GTop'));
-} catch (err) {
-    log(err);
+    GTop = imports.gi.GTop;
+} catch (e) {
+    global.log(e);
     hasGTop = false;
-};
+}
 
-export const Sensors = GObject.registerClass({
+var Sensors = GObject.registerClass({
     GTypeName: 'Sensors',
 }, class Sensors extends GObject.Object {
     _init(settings, sensorIcons) {
@@ -48,6 +51,13 @@ export const Sensors = GObject.registerClass({
 
         this._last_processor = { 'core': {}, 'speed': [] };
 
+        this._settingChangedSignals = [];
+        this._addSettingChangedSignal('show-gpu', this._reconfigureNvidiaSmiProcess.bind(this));
+        this._addSettingChangedSignal('update-time', this._reconfigureNvidiaSmiProcess.bind(this));
+
+        this._nvidia_smi_process = null;
+        this._nvidia_labels = [];
+
         if (hasGTop) {
             this.storage = new GTop.glibtop_fsusage();
             this._storageDevice = '';
@@ -56,6 +66,10 @@ export const Sensors = GObject.registerClass({
             this._lastRead = 0;
             this._lastWrite = 0;
         }
+    }
+
+    _addSettingChangedSignal(key, callback) {
+        this._settingChangedSignals.push(this._settings.connect('changed::' + key, callback));
     }
 
     _refreshIPAddress(callback) {
@@ -357,13 +371,10 @@ export const Sensors = GObject.registerClass({
         let battery_slot = this._settings.get_int('battery-slot');
 
         // addresses issue #161
-        let battery_key = 'BAT'; // BAT0, BAT1 and BAT2
+        let battery_key = 'BAT';
         if (battery_slot == 3) {
-            battery_key = 'CMB'; // CMB0
+            battery_key = 'CMB';
             battery_slot = 0;
-        } else if (battery_slot == 4) {
-            battery_key = 'macsmc-battery'; // supports Asahi linux
-            battery_slot = '';
         }
 
         // uevent has all necessary fields, no need to read individual files
@@ -473,6 +484,75 @@ export const Sensors = GObject.registerClass({
         }).catch(err => { });
     }
 
+    _parseNvidiaSmiLine(callback, csv) {
+        let csv_split = csv.split(',');
+        if (csv_split.length == 6) {
+            let [label, temp, fan_speed_pct, utilization_gpu, utilization_memory, power ] = csv_split;
+
+            if (!this._nvidia_labels.includes(label))
+                this._nvidia_labels.push(label);
+
+            if (this._settings.get_boolean('show-gpu')) {
+                let tempLabel = `${label} Temperature`;
+                this._returnValue(callback, tempLabel, parseInt(temp) * 1000, 'gpu', 'temp');
+            }
+            
+            if (this._settings.get_boolean('show-gpu')) {
+                let fanLabel = `${label} Fan`;
+                this._returnValue(callback, fanLabel, parseInt(fan_speed_pct) * 0.01, 'gpu', 'percent');
+            }
+
+            if (this._settings.get_boolean('show-gpu')) {
+                let utilLabel = `${label} Utilization`;
+                this._returnValue(callback, utilLabel, parseInt(utilization_gpu) * 0.01, 'gpu', 'percent');
+            }
+
+            if (this._settings.get_boolean('show-gpu')) {
+                let memLabel = `${label} Memory`;
+                this._returnValue(callback, memLabel, parseInt(utilization_memory) * 0.01, 'gpu', 'percent');
+            }
+
+            if (this._settings.get_boolean('show-gpu')) {
+                let powerLabel = `${label} Power`;
+                this._returnValue(callback, powerLabel, parseInt(utilization_memory) * 0.01, 'gpu', 'watt-gpu');
+            }
+
+        } else {
+            this._terminateNvidiaSmiProcess();
+        }
+    }
+
+    _queryGpu(callback) {
+        if (this._nvidia_smi_process) {
+            this._nvidia_smi_process.read('\n').then(lines => {
+                for (let csv of lines) {
+                    this._parseNvidiaSmiLine(callback, csv);
+                }
+            }).catch(err => {
+                this._terminateNvidiaSmiProcess();
+            });
+        } else {
+            for (let label of this._nvidia_labels) {
+                if (this._settings.get_boolean('show-gpu'))
+                    this._returnValue(callback, tempLabel, 'disabled', 'gpu', 'temp');
+
+                if (this._settings.get_boolean('show-gpu'))
+                    this._returnValue(callback, fanLabel, 'disabled', 'gpu', 'percent');
+
+                if (this._settings.get_boolean('show-gpu'))
+                    this._returnValue(callback, utilLabel, 'disabled', 'gpu', 'percent');
+
+                if (this._settings.get_boolean('show-gpu'))
+                    this._returnValue(callback, memLabel, 'disabled', 'gpu', 'percent');
+
+                if (this._settings.get_boolean('show-gpu'))
+                    this._returnValue(callback, powerLabel, 'disabled', 'gpu', 'watt-gpu');
+
+            
+            }
+        }
+    }
+
     _returnValue(callback, label, value, type, format) {
         // don't return if value is not a number - will revisit later
         //if (isNaN(value)) return;
@@ -563,6 +643,59 @@ export const Sensors = GObject.registerClass({
             new FileModule.File('/proc/version').read(' ').then(kernelArray => {
                 this._returnValue(callback, 'Kernel', kernelArray[2], 'system', 'string');
             }).catch(err => { });
+        }
+
+        // Launch nvidia-smi subprocess if nvidia querying is enabled
+        this._reconfigureNvidiaSmiProcess();
+    }
+
+    // The nvidia-smi subprocess will keep running and print new sensor data to stdout every
+    // `update_time` seconds. _queryNvidiaSmi() will be called at roughly the same interval and
+    // read from the subprocess's stdout to get new sensor data.
+
+    // Regarding "keeping main process & sub process in sync", there are two possible scenarios:
+    // - For some reason, nvidia-smi prints at a somewhat higher frequency than we call
+    //   _queryNvidiaSmi() to read data. This is okay, eventually one call to _queryNvidiaSmi()
+    //   will read two sensor data updates in a single call.
+    // - For some reason, _queryNvidiaSmi() is called at a somewhat higher frequency than
+    //   nvidia-smi prints data. This is the more likely scenario with user actions triggering
+    //   additional reads. This eventually triggers an "IO PENDING" error while attempting to
+    //   read, because the previous async read is still waiting. To solve this, the subprocess
+    //   module simply ignores PENDING errors. After ignoring the error, the earlier read will
+    //   eventually return and sensor data will be updated, so this scenario is handled correctly.
+
+    // Generally speaking, the call to _queryNvidiaSmi() and nvidia-smi's printing to stdout do
+    // not happen at the same time. So the async call in _queryNvidiaSmi() will usually have to
+    // wait up to `update_time` seconds before getting any results and reporting them through the
+    // callback.
+    _reconfigureNvidiaSmiProcess() {
+        if (this._settings.get_boolean('show-gpu')) {
+            this._terminateNvidiaSmiProcess();
+
+            try {
+                let update_time = this._settings.get_int('update-time');
+                let query_interval = Math.max(update_time, 1);
+                let command = [
+                    'nvidia-smi',
+                    '--query-gpu=name,temperature.gpu,fan.speed,utilization.gpu,utilization.memory,power.draw',
+                    '--format=csv,noheader,nounits',
+                    '-l', query_interval.toString()
+                ];
+
+                this._nvidia_smi_process = new SubProcessModule.SubProcess(command);
+            } catch(e) {
+                // proprietary nvidia driver not installed
+                this._terminateNvidiaSmiProcess();
+            }
+        } else {
+            this._terminateNvidiaSmiProcess();
+        }
+    }
+
+    _terminateNvidiaSmiProcess() {
+        if (this._nvidia_smi_process) {
+            this._nvidia_smi_process.terminate();
+            this._nvidia_smi_process = null;
         }
     }
 
@@ -667,5 +800,13 @@ export const Sensors = GObject.registerClass({
         this._processor_uses_cpu_info = true;
         this._battery_time_left_history = [];
         this._battery_charge_status = '';
+        this._nvidia_labels = [];
+    }
+
+    destroy() {
+        this._terminateNvidiaSmiProcess();
+
+        for (let signal of Object.values(this._settingChangedSignals))
+            this._settings.disconnect(signal);
     }
 });

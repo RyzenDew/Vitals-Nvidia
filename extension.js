@@ -40,7 +40,8 @@ var VitalsMenuButton = GObject.registerClass({
                            'icon-rx': 'network-download-symbolic.svg',
                            'icon-tx': 'network-upload-symbolic.svg' },
                 'storage' : { 'icon': 'storage-symbolic.svg' },
-                'battery' : { 'icon': 'battery-symbolic.svg' }
+                'battery' : { 'icon': 'battery-symbolic.svg' },
+                    'gpu' : { 'icon': 'battery-symbolic.svg' }
         }
 
         this._warnings = [];
@@ -555,6 +556,7 @@ var VitalsMenuButton = GObject.registerClass({
 
     destroy() {
         this._destroyTimer();
+        this._sensors.destroy();
 
         for (let signal of Object.values(this._settingChangedSignals))
             this._settings.disconnect(signal);
